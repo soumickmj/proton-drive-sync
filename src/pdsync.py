@@ -15,7 +15,7 @@ Author: Soumick Chatterjee, PhD (https://github.com/soumickmj) — MIT licence.
 Unofficial; not affiliated with or endorsed by Proton AG.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 
 import errno
 import fcntl
@@ -1310,6 +1310,20 @@ def run_sync(cfg):
             skip.append(rel)
         return False
 
+    def recheck(rel, l, r, s, now_ns):
+        """Before uploading over a stale view of the remote side, look at the file's current remote
+        version, so an edit made on Proton Drive since the last listing becomes a conflict copy."""
+        try:
+            cur = drive.list(rp(os.path.dirname(rel))).get(os.path.basename(rel))
+        except DriveError as ex:
+            if not ex.not_found:
+                raise
+            cur = None
+        if cur is not None and cur.is_dir:
+            log.warning("a file and a folder share the name %s; skipping it", rel)
+            return False, False
+        return sync_file(rel, l, cur, s, True, now_ns)
+
     def sync_file(rel, l, r, s, fresh, now_ns):
         """Returns (remote_modified, still_being_written)."""
         if l is not absent and now_ns - l[1] < 3_000_000_000:
@@ -1332,6 +1346,8 @@ def run_sync(cfg):
                 conflict(rel, r)
                 return True, False
             if l_changed:
+                if not fresh:
+                    return recheck(rel, l, r, s, now_ns)
                 upload(rel)
                 return True, False
             download(rel, r)
@@ -1343,6 +1359,8 @@ def run_sync(cfg):
                     state.pop(rel)
                     log.info("removed on Proton Drive, local copy moved to %s: %s", trash_root, rel)
                 return False, False
+            if not fresh:
+                return recheck(rel, l, r, s, now_ns)
             upload(rel)
             return True, False
         if r is not None:

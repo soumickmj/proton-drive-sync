@@ -69,6 +69,24 @@ sleep 6
 check "guard: local files NOT deleted" test -e "$L/f60"
 check "guard: logged"                  grep -q "sync paused" "$W/log"
 
+# Edit on both sides while the daemon's remote listing is stale (long remote_interval):
+# the remote edit must not be overwritten.
+kill $PID; wait $PID 2>/dev/null || true
+rm -rf "$R" "$L" "$XDG_STATE_HOME/proton-drive-sync/sync-state.json"; mkdir -p "$R" "$L"
+sed -i 's/"remote_interval": 2/"remote_interval": 600/' "$XDG_CONFIG_HOME/proton-drive-sync/config.json"
+echo base > "$R/s.txt"
+/usr/bin/python3 -I "$XDG_DATA_HOME/proton-drive-sync/pdsync.py" run 2>> "$W/log" & PID=$!
+check "stale: initial download"        grep -qx base "$L/s.txt"
+sleep 3
+echo remote-new > "$R/s.txt"; touch -d '5 seconds ago' "$R/s.txt"
+echo local-new > "$L/s.txt"; old "$L/s.txt"
+# done when either a conflict copy exists or the remote edit was overwritten
+stale_done() { grep -qx local-new "$R/s.txt" || find "$R" -maxdepth 1 -name 's (conflict *).txt' | grep -q .; }
+check "stale: daemon acted"            stale_done
+check "stale: remote edit not overwritten" grep -qx remote-new "$R/s.txt"
+check "stale: local edit kept as conflict copy" \
+    sh -c "find '$R' -maxdepth 1 -name 's (conflict *).txt' -exec grep -lx local-new {} + | grep -q ."
+
 echo "---- log tail"; tail -n 5 "$W/log"
 grep -E "Traceback|crashed" "$W/log" && { echo "FAIL exceptions in log"; fails=$((fails+1)); }
 echo "failures: $fails"; exit $fails

@@ -13,7 +13,7 @@ set -euo pipefail
 umask 077
 
 APP=proton-drive-sync
-VERSION=1.0.0
+VERSION=1.0.2
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$APP"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
