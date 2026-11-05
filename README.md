@@ -78,7 +78,7 @@ A removed download only frees disk space: the file stays visible, stays on Proto
 Changes take effect within seconds, without a restart. In mode 2 every file is always on the device, so these rules don't apply.
 
 ## Status icon
-- **Icon:** a cloud when everything is up to date, a download or upload arrow during transfers, and a warning icon on errors (for example when you need to log in again).
+- **Icon:** its own purple cloud, the same with any icon theme: a check mark when everything is up to date, a down or up arrow during transfers, circling arrows while syncing, red with **!** on errors (for example when you need to log in again) and grey when the service isn't running.
 - **Tooltip and right-click menu:** current transfers with progress, how many changes are waiting to upload, and recent activity.
 - **Storage settings in the right-click menu** (mode 1): see [Storage on this device](#storage-on-this-device-mode-1).
 - **Click:** opens the folder.
