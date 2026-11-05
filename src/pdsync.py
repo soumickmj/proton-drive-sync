@@ -15,7 +15,7 @@ Author: Soumick Chatterjee, PhD (https://github.com/soumickmj) — MIT licence.
 Unofficial; not affiliated with or endorsed by Proton AG.
 """
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 import errno
 import fcntl
@@ -94,13 +94,43 @@ def load_config():
     with open(CONFIG_FILE) as f:
         cfg = json.load(f)
     cfg.setdefault("list_ttl", 30)
-    cfg.setdefault("cache_max_gb", 10)
     cfg.setdefault("local_interval", 15)
     cfg.setdefault("remote_interval", 120)
     cfg.setdefault("upload_delay", 3)
     cfg.setdefault("no_download_procs", DEFAULT_NO_DOWNLOAD_PROCS)
     cfg.setdefault("no_download_cmdline", DEFAULT_NO_DOWNLOAD_CMDLINE)
+    return with_storage_defaults(cfg)
+
+
+def with_storage_defaults(cfg):
+    """Mode-1 storage settings; they can be changed while running (tray menu, CLI)."""
+    cfg.setdefault("cache_max_gb", 10)       # 0 = no limit (pinned files never count)
+    cfg.setdefault("cache_expire_days", 30)  # 0 = never remove unused downloads by age
+    cfg.setdefault("min_free_gb", 2)         # always leave this much free on the disk
+    cfg.setdefault("pinned", [])             # mount paths ("/Work/Data") always kept on this device
     return cfg
+
+
+def update_config(change):
+    """Applies change(cfg) to config.json atomically; safe against concurrent writers."""
+    with open(CONFIG_FILE + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        change(cfg)
+        atomic_write_json(CONFIG_FILE, cfg)
+        return cfg
+
+
+def under(path, parent):
+    return path == parent or parent == "/" or path.startswith(parent.rstrip("/") + "/")
+
+
+def request_free(paths):
+    """Asks the running daemon to remove the downloaded copies of these mount paths."""
+    d = os.path.join(STATE_DIR, "requests")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    atomic_write_json(os.path.join(d, uuid.uuid4().hex + ".json"), {"op": "free", "paths": list(paths)})
 
 
 def parse_time(value):
@@ -207,6 +237,7 @@ class Status:
         self.recent = deque(maxlen=15)
         self.error = None
         self.pending_fn = lambda: 0
+        self.cache = None  # mode 1 storage use, set by the mount
         self.last = None
         self.seq = 0
         threading.Thread(target=self.writer, daemon=True).start()
@@ -269,7 +300,7 @@ class Status:
             pending = 0
         state = "error" if error else "busy" if active or pending else "idle"
         return {"mode": self.mode, "root": self.root, "state": state, "active": active,
-                "pending_uploads": pending, "recent": recent, "error": error}
+                "pending_uploads": pending, "recent": recent, "error": error, "cache": self.cache}
 
     def writer(self):
         while True:
@@ -458,7 +489,6 @@ def run_mount(cfg):
         os.makedirs(d, mode=0o700, exist_ok=True)
     shutil.rmtree(os.path.join(CACHE_DIR, "staging"), ignore_errors=True)
     os.makedirs(os.path.join(CACHE_DIR, "staging"), mode=0o700, exist_ok=True)
-    max_cache = int(float(cfg["cache_max_gb"]) * 1024 ** 3)
     blocked_procs = tuple(cfg["no_download_procs"])
     blocked_cmdline = tuple(cfg.get("no_download_cmdline", DEFAULT_NO_DOWNLOAD_CMDLINE))
     uid, gid = os.getuid(), os.getgid()
@@ -499,6 +529,12 @@ def run_mount(cfg):
             threading.Thread(target=self.bg_worker, daemon=True).start()
             threading.Thread(target=self.dirs_saver, daemon=True).start()
             status.pending_fn = lambda: len(self.upload_due)
+            self.settings = with_storage_defaults(dict(cfg))
+            self.cfg_mtime = self.config_mtime()
+            self.pin_wake = threading.Event()
+            self.pin_problem = None
+            threading.Thread(target=self.maintenance, daemon=True).start()
+            threading.Thread(target=self.pin_worker, daemon=True).start()
 
         # ---------- helpers ----------
         def rpath(self, path):
@@ -678,7 +714,7 @@ def run_mount(cfg):
             if node.is_dir:
                 return dict(st_mode=stat.S_IFDIR | 0o700, st_nlink=2, st_uid=uid, st_gid=gid,
                             st_mtime=node.mtime, st_atime=node.mtime, st_ctime=node.mtime, st_size=4096)
-            # placeholders report 0 blocks (like OneDrive), so du/file managers count only cached data
+            # not-yet-downloaded files report 0 blocks, so du and file managers count only cached data
             size, blocks = node.size, 0
             if entry is not None:
                 try:
@@ -744,10 +780,11 @@ def run_mount(cfg):
             self.invalidate(path)
             self.fetch(os.path.dirname(path))
             status.event("trash", path)
+            self.update_pins(path)
             return 0
 
         # ---------- files ----------
-        def ensure_local(self, path, node, entry, need_content=True):
+        def ensure_local(self, path, node, entry, need_content=True, who=None):
             """Make sure a cache file exists for `path`; download when needed."""
             if entry is not None and os.path.exists(self.cfile(entry)):
                 if entry.get("dirty") or entry.get("pending") or node is None or entry.get("rev") == node.rev:
@@ -757,9 +794,13 @@ def run_mount(cfg):
             cid = uuid.uuid4().hex
             target = os.path.join(files_dir, cid)
             if need_content:
-                who = self.caller()
+                who = who or self.caller()
                 if self.caller_blocked(who):
                     raise fuse.FuseOSError(errno.EACCES)
+                if not self.make_room(node.size):
+                    log.error("not enough disk space to download %s (%s)", path, human_size(node.size))
+                    status.event("download", path, ok=False, msg="not enough disk space")
+                    raise fuse.FuseOSError(errno.ENOSPC)
                 tmpdir = tempfile.mkdtemp(prefix="dl-", dir=os.path.join(CACHE_DIR, "staging"))
                 try:
                     log.info("downloading %s (opened by %s)", path, who[0] or "?")
@@ -791,32 +832,192 @@ def run_mount(cfg):
             self.evict()
             return entry
 
-        def evict(self):
+        # ---------- storage: limit, expiry, free disk space, pinned files ----------
+        def is_pinned(self, path):
+            return any(under(path, p) for p in self.settings["pinned"])
+
+        def disk_free(self):
+            st = os.statvfs(files_dir)
+            return st.f_bavail * st.f_frsize
+
+        def evict(self, need=0, free_paths=()):
+            """Removes downloaded copies that are safe to remove (uploaded, closed, not pinned):
+            those under `free_paths`, those unused for longer than the expiry, then least recently
+            used ones while over the size limit or while the disk is short of space.
+            Returns True when `need` more bytes fit on the disk."""
+            st = self.settings
+            limit = int(float(st["cache_max_gb"]) * 1024 ** 3)
+            expire = float(st["cache_expire_days"]) * 86400
+            min_free = int(float(st["min_free_gb"]) * 1024 ** 3)
+            now = time.time()
             with self.mu:
-                items = []
-                total = 0
+                items, used, pinned = [], 0, 0
                 for p, e in self.index.items():
                     try:
-                        size = os.lstat(self.cfile(e)).st_size
+                        size = os.lstat(self.cfile(e)).st_blocks * 512
                     except OSError:
                         continue
-                    total += size
+                    if self.is_pinned(p):
+                        pinned += size
+                        continue
+                    used += size
                     if not e.get("dirty") and not e.get("pending") and not self.open_count.get(p):
                         items.append((e.get("atime", 0), p, size))
                 items.sort()
+                free = self.disk_free()
                 changed = False
-                for _, p, size in items:
-                    if total <= max_cache:
-                        break
+                for atime, p, size in items:
+                    if not (any(under(p, f) for f in free_paths) or (expire and now - atime > expire)
+                            or (limit and used > limit) or free - need < min_free):
+                        if not free_paths:
+                            break  # sorted by last use: nothing older is left to remove
+                        continue
                     try:
                         os.unlink(self.cfile(self.index[p]))
                     except OSError:
                         pass
                     del self.index[p]
-                    total -= size
+                    used -= size
+                    free += size
                     changed = True
                 if changed:
                     self.save_index()
+                status.cache = {"used": used, "pinned": pinned, "limit": limit, "free": free,
+                                "expire_days": st["cache_expire_days"], "pins": len(st["pinned"]),
+                                "problem": self.pin_problem}
+                return free - need >= min_free
+
+        def make_room(self, size):
+            return self.evict(need=size or 0)
+
+        def config_mtime(self):
+            try:
+                return os.stat(CONFIG_FILE).st_mtime_ns
+            except OSError:
+                return None
+
+        def reload_settings(self):
+            try:
+                with open(CONFIG_FILE) as f:
+                    new = with_storage_defaults(json.load(f))
+            except (OSError, ValueError):
+                return
+            pins_changed = new["pinned"] != self.settings["pinned"]
+            self.settings = {k: new[k] for k in ("cache_max_gb", "cache_expire_days", "min_free_gb", "pinned")}
+            log.info("storage settings: limit %s GB, remove unused after %s days, %d kept on this device",
+                     new["cache_max_gb"] or "no", new["cache_expire_days"] or "never", len(new["pinned"]))
+            if pins_changed:
+                self.pin_wake.set()
+            self.evict()
+
+        def handle_requests(self):
+            d = os.path.join(STATE_DIR, "requests")
+            try:
+                names = sorted(os.listdir(d))
+            except OSError:
+                return
+            for n in names:
+                p = os.path.join(d, n)
+                try:
+                    with open(p) as f:
+                        req = json.load(f)
+                except (OSError, ValueError):
+                    req = {}
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+                if req.get("op") == "free":
+                    before = (status.cache or {}).get("used", 0)
+                    self.evict(free_paths=tuple(req.get("paths") or ()))
+                    freed = before - (status.cache or {}).get("used", 0)
+                    log.info("freed %s for %s", human_size(max(0, freed)), ", ".join(req.get("paths") or []))
+                    status.event("free", ", ".join(req.get("paths") or []), msg=human_size(max(0, freed)))
+
+        def maintenance(self):
+            last_sweep = 0
+            while True:
+                time.sleep(2)
+                try:
+                    m = self.config_mtime()
+                    if m != self.cfg_mtime:
+                        self.cfg_mtime = m
+                        self.reload_settings()
+                    self.handle_requests()
+                    if time.time() - last_sweep > 60:
+                        last_sweep = time.time()
+                        self.evict()
+                except Exception:
+                    log.exception("storage maintenance failed")
+
+        def pin_worker(self):
+            """Downloads everything that is pinned and keeps it up to date."""
+            _tl.prio = PRIO_BG
+            who = (APP_NAME, "keep-on-device", "")
+            while True:
+                self.pin_wake.wait(timeout=300)
+                self.pin_wake.clear()
+                problem = None
+                for pin in list(self.settings["pinned"]):
+                    todo = [pin]
+                    while todo:
+                        if self.pin_wake.is_set():
+                            break  # pins changed: start over
+                        path = todo.pop()
+                        parent, name = os.path.split(path)
+                        try:
+                            if path == "/":
+                                node = Node("", "", True, 0, 0, None)
+                            else:
+                                with self.mu:
+                                    cached = self.dirs.get(parent)
+                                nodes = cached[1] if cached and time.time() - cached[0] < cfg["list_ttl"] \
+                                    else self.fetch(parent)
+                                node = nodes.get(name)
+                            if node is None:
+                                continue
+                            if node.is_dir:
+                                prefix = path.rstrip("/") + "/"
+                                todo.extend(prefix + n for n in self.fetch(path))
+                                continue
+                            with self.path_lock(path):
+                                with self.mu:
+                                    entry = self.index.get(path)
+                                    busy = self.open_count.get(path) or (entry and entry.get("dirty"))
+                                if not busy:
+                                    self.ensure_local(path, node, entry, who=who)
+                        except fuse.FuseOSError as ex:
+                            if ex.errno == errno.ENOSPC:
+                                problem = "Not enough disk space to keep all chosen files on this device"
+                                todo.clear()
+                        except Exception as ex:
+                            log.warning("keeping %s on this device failed: %s", path, getattr(ex, "message", ex))
+                if problem != self.pin_problem:
+                    if problem:
+                        status.set_error(problem)
+                    elif status.error == self.pin_problem:
+                        status.set_error(None)
+                    self.pin_problem = problem
+                self.evict()
+
+        def update_pins(self, old, new=None):
+            """A pinned item (or its parent) was renamed to `new`, or deleted when `new` is None."""
+            if not any(under(p, old) for p in self.settings["pinned"]):
+                return
+            def change(c):
+                pins = []
+                for p in c.get("pinned", []):
+                    if under(p, old):
+                        if new is None:
+                            continue
+                        p = new + p[len(old):]
+                    pins.append(p)
+                c["pinned"] = pins
+            try:
+                self.settings["pinned"] = update_config(change)["pinned"]
+                self.cfg_mtime = self.config_mtime()
+            except (OSError, ValueError) as ex:
+                log.warning("could not update kept-on-device list: %s", ex)
 
         def _open(self, path, flags, entry):
             fd = os.open(self.cfile(entry), flags & ~(os.O_CREAT | os.O_EXCL))
@@ -939,6 +1140,7 @@ def run_mount(cfg):
                     self.dirs_dirty = True
             if node is not None:
                 status.event("trash", path)
+                self.update_pins(path)
             return 0
 
         def rename(self, old, new, flags=0):
@@ -1019,6 +1221,7 @@ def run_mount(cfg):
             if nparent != oparent:
                 self.fetch(nparent)
             status.event("move" if oparent != nparent else "rename", new)
+            self.update_pins(old, new)
             return 0
 
         def symlink(self, target, source):
@@ -1494,7 +1697,8 @@ SNI_XML = """<node>
 
 OP_TEXT = {"download": ("Downloading", "Downloaded", "↓"), "upload": ("Uploading", "Uploaded", "↑"),
            "mkdir": (None, "Created folder", "+"), "trash": (None, "Moved to trash", "🗑"),
-           "rename": (None, "Renamed", "✎"), "move": (None, "Moved", "→")}
+           "rename": (None, "Renamed", "✎"), "move": (None, "Moved", "→"),
+           "free": (None, "Freed space in", "♻")}
 
 
 def human_size(n):
@@ -1585,7 +1789,8 @@ def run_tray(cfg):
         for r in s.get("recent", [])[:8]:
             _, done_verb, _ = OP_TEXT.get(r["op"], (r["op"], r["op"], "•"))
             when = datetime.fromtimestamp(r["t"]).strftime("%H:%M")
-            recent.append(f"{when}  {'✓' if r['ok'] else '✗ Failed:'} {done_verb} {short(r['path'], 50)}")
+            what = f"Freed {r.get('msg') or 'space'}" if r["op"] == "free" else f"{done_verb} {short(r['path'], 50)}"
+            recent.append(f"{when}  {'✓' if r['ok'] else '✗ Failed:'} {what}")
         if s.get("error"):
             return ICONS["error"], s["error"], lines, recent
         ops = {a["op"] for a in s.get("active", [])}
@@ -1600,51 +1805,151 @@ def run_tray(cfg):
         n = len(s.get("active", []))
         return ic, f"Syncing {n} item(s)…" if n else "Waiting to upload…", lines, recent
 
+    def read_settings():
+        try:
+            with open(CONFIG_FILE) as f:
+                return with_storage_defaults(json.load(f))
+        except (OSError, ValueError):
+            return with_storage_defaults({})
+
+    def set_setting(key, value):
+        update_config(lambda c: c.__setitem__(key, value))
+
+    def unpin(p):
+        update_config(lambda c: c.__setitem__("pinned", [q for q in c.get("pinned", []) if q != p]))
+
+    def pick_folder():
+        """Asks for a folder inside the drive with whatever dialog tool the desktop has."""
+        title = "Choose a folder to always keep on this device"
+        for tool in (["kdialog", "--title", title, "--getexistingdirectory", root],
+                     ["zenity", "--file-selection", "--directory", "--title", title, f"--filename={root}/"],
+                     ["qarma", "--file-selection", "--directory", "--title", title, f"--filename={root}/"],
+                     ["yad", "--file", "--directory", "--title", title, f"--filename={root}/"]):
+            if shutil.which(tool[0]):
+                break
+        else:
+            notify("Proton Drive", "Right-click a folder in your file manager and choose Proton Drive > "
+                                   "Always keep on this device, or run: proton-drive-sync pin FOLDER")
+            return
+
+        def run():
+            r = subprocess.run(tool, capture_output=True, text=True)
+            chosen = r.stdout.strip()
+            if r.returncode == 0 and chosen:
+                storage_command(dict(cfg), "pin", [chosen])
+        threading.Thread(target=run, daemon=True).start()
+
     def build_menu():
+        """Menu tree of (id, props, children); ids are stable hashes so clicks survive rebuilds."""
+        import zlib
+        flat, actions = {}, {}
+
+        def mk(key, label=None, enabled=True, icon=None, sep=False, radio=None, children=None, action=None):
+            i = (zlib.crc32(key.encode()) & 0x7fffffff) or 1
+            props = {"type": GLib.Variant("s", "separator")} if sep else \
+                {"label": GLib.Variant("s", label.replace("_", "__"))}
+            if not enabled:
+                props["enabled"] = GLib.Variant("b", False)
+            if icon:
+                props["icon-name"] = GLib.Variant("s", icon)
+            if radio is not None:
+                props["toggle-type"] = GLib.Variant("s", "radio")
+                props["toggle-state"] = GLib.Variant("i", 1 if radio else 0)
+            if children is not None:
+                props["children-display"] = GLib.Variant("s", "submenu")
+            flat[i], actions[i] = props, action
+            return (i, props, children or [])
+
         ic, head, lines, recent = describe()
-        items = [(1, {"label": GLib.Variant("s", head.replace("_", "__")), "enabled": GLib.Variant("b", False)})]
-        i = 10
-        for ln in lines:
-            items.append((i, {"label": GLib.Variant("s", ln.replace("_", "__")), "enabled": GLib.Variant("b", False)}))
-            i += 1
-        items.append((2, {"type": GLib.Variant("s", "separator")}))
+        items = [mk("head", head, enabled=False)]
+        items += [mk(f"line{n}", ln, enabled=False) for n, ln in enumerate(lines)]
+        items.append(mk("sep1", sep=True))
         if recent:
-            items.append((3, {"label": GLib.Variant("s", "Recent activity"), "enabled": GLib.Variant("b", False)}))
-            i = 100
-            for ln in recent:
-                items.append((i, {"label": GLib.Variant("s", ln.replace("_", "__")),
-                                  "enabled": GLib.Variant("b", False)}))
-                i += 1
-            items.append((4, {"type": GLib.Variant("s", "separator")}))
-        items.append((5, {"label": GLib.Variant("s", "Open Proton Drive folder"),
-                          "icon-name": GLib.Variant("s", "folder-open")}))
-        items.append((6, {"label": GLib.Variant("s", "Open Proton Drive in browser"),
-                          "icon-name": GLib.Variant("s", "internet-web-browser")}))
-        items.append((4999, {"type": GLib.Variant("s", "separator")}))
-        items.append((7, {"label": GLib.Variant("s", "Hide this icon"), "icon-name": GLib.Variant("s", "window-close")}))
-        st["items"] = dict(items)
+            items.append(mk("recent", "Recent activity", enabled=False))
+            items += [mk(f"recent{n}", ln, enabled=False) for n, ln in enumerate(recent)]
+            items.append(mk("sep2", sep=True))
+        if cfg["mode"] == "mount":
+            conf = read_settings()
+            c = st["snap"].get("cache") or {}
+            limit = conf["cache_max_gb"]
+            items.append(mk("usage", f"On this device: {human_size(c.get('used', 0))} downloaded"
+                            f"{f' of {limit} GB' if limit else ''}, {human_size(c.get('pinned', 0))} always kept",
+                            enabled=False))
+            if c.get("problem"):
+                items.append(mk("problem", "⚠ " + c["problem"], enabled=False))
+            items.append(mk("limit", "Space for downloaded files", icon="drive-harddisk", children=[
+                mk(f"limit{v}", f"{v} GB" if v else "No limit", radio=limit == v,
+                   action=lambda v=v: set_setting("cache_max_gb", v)) for v in (5, 10, 20, 50, 100, 250, 0)]))
+            exp = conf["cache_expire_days"]
+            items.append(mk("expire", "Remove downloads not opened for", icon="chronometer", children=[
+                mk(f"expire{v}", f"{v} days" if v else "Never", radio=exp == v,
+                   action=lambda v=v: set_setting("cache_expire_days", v)) for v in (7, 14, 30, 90, 0)]))
+            pins = [mk(f"pin:{p}", f"✓ {short(p) or 'Everything'}  (click to stop keeping)",
+                       action=lambda p=p: unpin(p)) for p in conf["pinned"]]
+            if not pins:
+                pins = [mk("nopins", "Nothing yet", enabled=False)]
+            items.append(mk("pins", "Always keep on this device", icon="folder-download", children=pins + [
+                mk("pinsep", sep=True),
+                mk("pinadd", "Add a folder…", icon="list-add", action=pick_folder)]))
+            items.append(mk("free", "Free up space now", icon="edit-clear",
+                            action=lambda: request_free(["/"])))
+            items.append(mk("sep3", sep=True))
+        items.append(mk("open", "Open Proton Drive folder", icon="folder-open",
+                        action=lambda: open_uri(Gio.File.new_for_path(root).get_uri())))
+        items.append(mk("web", "Open Proton Drive in browser", icon="internet-web-browser",
+                        action=lambda: open_uri("https://drive.proton.me/")))
+        items.append(mk("sep4", sep=True))
+        items.append(mk("quit", "Hide until next login", icon="window-close", action=hide))
+        st["items"], st["actions"] = flat, actions
         return items
 
-    def layout_variant():
-        children = [GLib.Variant("(ia{sv}av)", (i, props, [])) for i, props in build_menu()]
-        return GLib.Variant("(u(ia{sv}av))", (st["rev"], (0, {"children-display": GLib.Variant("s", "submenu")},
-                                                           children)))
+    def layout_variant(parent_id=0, depth=-1):
+        """The menu below `parent_id` (0 = top level), `depth` levels deep (-1 = all): a submenu
+        must get its own items, not the whole menu again."""
+        def v(node, d):
+            i, props, children = node
+            kids = [] if d == 0 else [v(c, d - 1) for c in children]
+            return GLib.Variant("(ia{sv}av)", (i, props, kids))
+
+        def find(nodes, i):
+            for n in nodes:
+                if n[0] == i:
+                    return n
+                hit = find(n[2], i)
+                if hit:
+                    return hit
+            return None
+        top = (0, {"children-display": GLib.Variant("s", "submenu")}, build_menu())
+        node = top if parent_id == 0 else find(top[2], parent_id) or (parent_id, {}, [])
+        i, props, children = node
+        kids = [] if depth == 0 else [v(c, depth - 1) for c in children]
+        return GLib.Variant("(u(ia{sv}av))", (st["rev"], (i, props, kids)))
 
     def open_uri(uri):
         try:
             Gio.AppInfo.launch_default_for_uri(uri, None)
         except GLib.Error as ex:
-            log.warning("could not open %s: %s", uri, ex.message)
+            log.warning("could not open %s (%s); trying xdg-open", uri, ex.message)
+            if shutil.which("xdg-open"):
+                subprocess.Popen(["xdg-open", uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def hide():
+        notify("Proton Drive", "The status icon is hidden until you log in again. Syncing continues. "
+                               "To show it now, run: proton-drive-sync start")
+        loop.quit()
 
     def on_menu_event(item_id, event_id):
         if event_id != "clicked":
             return
-        if item_id == 5:
-            open_uri(Gio.File.new_for_path(root).get_uri())
-        elif item_id == 6:
-            open_uri("https://drive.proton.me/")
-        elif item_id == 7:
-            loop.quit()
+        action = st.get("actions", {}).get(item_id)
+        label = st.get("items", {}).get(item_id, {}).get("label")
+        log.info("menu: %s", label.unpack() if label else f"item {item_id} (no action)")
+        if action:
+            try:
+                action()
+            except Exception as ex:
+                log.warning("menu action failed: %s", ex)
+                notify("Proton Drive", f"That did not work: {ex}")
 
     def tooltip():
         ic, head, lines, recent = describe()
@@ -1658,10 +1963,13 @@ def run_tray(cfg):
             inv.return_value(None)
             return
         if method == "GetLayout":
-            inv.return_value(layout_variant())
+            parent_id, depth, _ = params.unpack()
+            inv.return_value(layout_variant(parent_id, depth))
         elif method == "GetGroupProperties":
             ids = params.unpack()[0]
-            out = [(i, p) for i, p in (st["items"] or dict(build_menu())).items() if not ids or i in ids]
+            if not st["items"]:
+                build_menu()
+            out = [(i, p) for i, p in st["items"].items() if not ids or i in ids]
             inv.return_value(GLib.Variant("(a(ia{sv}))", (out,)))
         elif method == "GetProperty":
             i, name = params.unpack()
@@ -1705,9 +2013,13 @@ def run_tray(cfg):
             mtime = os.stat(status_path).st_mtime_ns
         except OSError:
             mtime = None
-        if running == st["running"] and mtime == st["mtime"]:
+        try:
+            cmtime = os.stat(CONFIG_FILE).st_mtime_ns
+        except OSError:
+            cmtime = None
+        if running == st["running"] and mtime == st["mtime"] and cmtime == st.get("cmtime"):
             return True
-        st["running"], st["mtime"] = running, mtime
+        st["running"], st["mtime"], st["cmtime"] = running, mtime, cmtime
         try:
             with open(status_path) as f:
                 st["snap"] = json.load(f)
@@ -1748,6 +2060,101 @@ def run_tray(cfg):
     loop.run()
 
 
+# --------------------------------------------------------------------------------------
+# Storage commands (mode 1): used from the terminal, file-manager menus and the tray icon
+# --------------------------------------------------------------------------------------
+
+STORAGE_COMMANDS = ("pin", "unpin", "pins", "free", "cache", "set")
+
+
+def mount_path(arg, root):
+    """Local path inside the mount -> mount path ("/Work/a.txt"), or None if outside."""
+    a, root = os.path.abspath(os.path.expanduser(arg)), os.path.abspath(root)
+    if a == root:
+        return "/"
+    return a[len(root):] if a.startswith(root + "/") else None
+
+
+def storage_command(cfg, cmd, args):
+    def say(msg, ok=True):
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        if not sys.stdout.isatty():  # started from a file manager: show a notification instead
+            notify("Proton Drive", msg)
+        return 0 if ok else 1
+
+    if cfg["mode"] != "mount":
+        return say("Keeping files on this device and freeing space only apply to mode 1 "
+                   "(in mode 2 every file is always on this device).", ok=False)
+    root = cfg["local_path"]
+    cfg = with_storage_defaults(cfg)
+    if cmd in ("pin", "unpin", "free"):
+        if not args:
+            return say(f"Usage: proton-drive-sync {cmd} PATH...", ok=False)
+        paths = []
+        for a in args:
+            p = mount_path(a, root)
+            if p is None:
+                return say(f"{a} is not inside your Proton Drive folder ({root}).", ok=False)
+            paths.append(p)
+        if cmd == "pin":
+            def change(c):
+                pins = c.setdefault("pinned", [])
+                for p in paths:
+                    if not any(under(p, q) for q in pins):
+                        pins[:] = [q for q in pins if not under(q, p)] + [p]
+            update_config(change)
+            names = ", ".join(os.path.basename(p) or "Proton Drive" for p in paths)
+            return say(f"{names}: will always be kept on this device (downloading in the background).")
+        if cmd in ("unpin", "free"):
+            pins = cfg["pinned"]
+            blocked = [(p, q) for p in paths for q in pins if under(p, q) and p != q]
+            update_config(lambda c: c.__setitem__("pinned", [q for q in c.get("pinned", [])
+                                                             if not any(under(q, p) for p in paths)]))
+            if cmd == "free":
+                request_free(paths)
+            msg = ("Freeing up space: downloaded copies are removed; files stay visible and download again "
+                   "when opened." if cmd == "free" else "No longer always kept on this device.")
+            if blocked:
+                msg += f" Note: {blocked[0][0]} is inside {blocked[0][1]}, which is still always kept."
+            return say(msg)
+    if cmd == "pins":
+        for p in cfg["pinned"]:
+            print(os.path.join(root, p.lstrip("/")))
+        if not cfg["pinned"]:
+            print("Nothing is pinned. Use: proton-drive-sync pin PATH")
+        return 0
+    if cmd == "cache":
+        try:
+            with open(os.path.join(STATE_DIR, "status.json")) as f:
+                c = json.load(f).get("cache") or {}
+        except (OSError, ValueError):
+            c = {}
+        print(f"Downloaded files:      {human_size(c.get('used', 0))}"
+              f" (limit: {str(cfg['cache_max_gb']) + ' GB' if cfg['cache_max_gb'] else 'none'})")
+        print(f"Always kept on device: {human_size(c.get('pinned', 0))} in {len(cfg['pinned'])} item(s)")
+        print(f"Remove unused after:   {str(cfg['cache_expire_days']) + ' days' if cfg['cache_expire_days'] else 'never'}")
+        print(f"Keep free on disk:     {cfg['min_free_gb']} GB (now free: {human_size(c.get('free'))})")
+        if c.get("problem"):
+            print(f"Problem:               {c['problem']}")
+        return 0
+    if cmd == "set":
+        keys = {"cache-limit": "cache_max_gb", "expire-days": "cache_expire_days", "min-free": "min_free_gb"}
+        if len(args) != 2 or args[0] not in keys:
+            return say("Usage: proton-drive-sync set cache-limit GB|none | expire-days DAYS|never | "
+                       "min-free GB", ok=False)
+        v = args[1].lower()
+        try:
+            value = 0 if v in ("none", "never", "off", "0") else float(v)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            return say(f"Not a number: {args[1]}", ok=False)
+        value = int(value) if value == int(value) else value
+        update_config(lambda c: c.__setitem__(keys[args[0]], value))
+        return say(f"{args[0]} set to {value or args[1]}.")
+    return 2
+
+
 def main():
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
@@ -1767,6 +2174,8 @@ def main():
             run_sync(cfg)
     elif cmd == "tray":
         run_tray(cfg)
+    elif cmd in STORAGE_COMMANDS:
+        sys.exit(storage_command(cfg, cmd, sys.argv[2:]))
     else:
         print(f"unknown command {cmd}", file=sys.stderr)
         sys.exit(2)

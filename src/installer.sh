@@ -6,6 +6,7 @@
 #
 #   ./proton-drive-sync            install / reconfigure
 #   proton-drive-sync status|start|stop|restart|logs|login|logout|update|reset-state|cli ...|uninstall|version
+#   proton-drive-sync pin|unpin|free PATH... | pins | cache | set cache-limit|expire-days|min-free VALUE
 #
 # Author: Soumick Chatterjee, PhD (https://github.com/soumickmj) — MIT licence.
 # Unofficial; not affiliated with or endorsed by Proton AG.
@@ -13,7 +14,7 @@ set -euo pipefail
 umask 077
 
 APP=proton-drive-sync
-VERSION=1.0.2
+VERSION=1.1.0
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$APP"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
@@ -313,8 +314,53 @@ NoDisplay=true
 EOF
         do_start
     fi
-    [ "$mode" = mount ] && exclude_from_indexers "$local_path"
+    if [ "$mode" = mount ]; then
+        exclude_from_indexers "$local_path"
+        install_file_manager_menus
+    fi
     install_tray
+}
+
+# Right-click entries "Always keep on this device" / "Free up space" in Dolphin and Nautilus.
+FM_SERVICEMENU="${XDG_DATA_HOME:-$HOME/.local/share}/kio/servicemenus/$APP.desktop"
+FM_NAUTILUS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus/scripts"
+install_file_manager_menus() {
+    mkdir -p "$(dirname "$FM_SERVICEMENU")"
+    cat > "$FM_SERVICEMENU" <<EOF
+[Desktop Entry]
+Type=Service
+MimeType=all/all;
+X-KDE-Submenu=Proton Drive
+Actions=keep;free;
+
+[Desktop Action keep]
+Name=Always keep on this device
+Icon=folder-download
+Exec=$BIN_DIR/$APP pin %F
+
+[Desktop Action free]
+Name=Free up space
+Icon=edit-clear
+Exec=$BIN_DIR/$APP free %F
+EOF
+    chmod 755 "$FM_SERVICEMENU"  # KDE only runs executable service menus
+    if [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/nautilus" ] || command -v nautilus >/dev/null 2>&1; then
+        mkdir -p "$FM_NAUTILUS_DIR"
+        local action label
+        for action in pin free; do
+            [ $action = pin ] && label="Proton Drive - Always keep on this device" || label="Proton Drive - Free up space"
+            printf '#!/bin/sh\nset -f\nIFS="\n"\nexec "%s" %s $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS\n' \
+                "$BIN_DIR/$APP" "$action" > "$FM_NAUTILUS_DIR/$label"
+            chmod 700 "$FM_NAUTILUS_DIR/$label"
+        done
+    fi
+    info "Added 'Always keep on this device' and 'Free up space' to the file manager's right-click menu."
+}
+
+remove_file_manager_menus() {
+    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/kio/servicemenus/$APP.desktop" \
+          "${XDG_DATA_HOME:-$HOME/.local/share}/nautilus/scripts/Proton Drive - Always keep on this device" \
+          "${XDG_DATA_HOME:-$HOME/.local/share}/nautilus/scripts/Proton Drive - Free up space"
 }
 
 # KDE's Baloo indexer would otherwise crawl the whole mounted drive.
@@ -376,10 +422,24 @@ EOF
 }
 
 do_start() {
-    if [ -f "$UNIT" ] && has_systemd_user; then systemctl --user start "$APP.service"; return; fi
-    mkdir -p "$STATE_DIR"
-    nohup setsid "$PY" -I "$DATA_DIR/pdsync.py" run >>"$LOG_FILE" 2>&1 </dev/null &
-    info "Started (log: $LOG_FILE)"
+    if [ -f "$UNIT" ] && has_systemd_user; then
+        systemctl --user start "$APP.service"
+    else
+        mkdir -p "$STATE_DIR"
+        nohup setsid "$PY" -I "$DATA_DIR/pdsync.py" run >>"$LOG_FILE" 2>&1 </dev/null &
+        info "Started (log: $LOG_FILE)"
+    fi
+    start_tray
+}
+
+# (Re)shows the status icon, e.g. after "Hide until next login".
+start_tray() {
+    if [ -f "$TRAY_UNIT" ] && has_systemd_user; then
+        systemctl --user start "$APP-tray.service" 2>/dev/null || true
+    elif [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP-tray.desktop" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] &&
+         ! pgrep -u "$(id -u)" -f "$DATA_DIR/pdsync.py tray" >/dev/null; then
+        nohup setsid "$PY" -I "$DATA_DIR/pdsync.py" tray >/dev/null 2>&1 </dev/null &
+    fi
 }
 
 do_stop() {
@@ -439,6 +499,7 @@ do_uninstall() {
     fi
     pkill -u "$(id -u)" -f "$DATA_DIR/pdsync.py tray" 2>/dev/null || true
     rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP-tray.desktop"
+    remove_file_manager_menus
     local local_path; local_path=$(cfg_get local_path)
     if confirm "Sign out of Proton Drive (removes the stored session)?" y; then cli_env auth logout || true; fi
     rm -rf "$CACHE_DIR" "$STATE_DIR" "$CONFIG_DIR"
@@ -580,7 +641,10 @@ main() {
         logs) do_logs ;;
         login) cli_env auth login </dev/tty; do_stop; do_start ;;
         logout) do_stop; cli_env auth logout ;;
-        update) download_cli; extract_daemon "$(readlink -f "$0")"; do_stop; do_start; install_tray ;;
+        update) download_cli; extract_daemon "$(readlink -f "$0")"; do_stop; do_start
+                [ "$(cfg_get mode)" = mount ] && install_file_manager_menus
+                install_tray ;;
+        pin|unpin|pins|free|cache|set) exec "$PY" -I "$DATA_DIR/pdsync.py" "$cmd" "$@" ;;
         reset-state)
             [ "$(cfg_get mode)" = sync ] || die "Only used in single-folder mode."
             say "This forgets what was synced before. The next run merges both sides again"

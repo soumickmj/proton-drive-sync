@@ -227,6 +227,59 @@ pl.release()
 for th in ths:
     th.join()
 check("priority lock serves UI before background", lambda: order == [0, 1, 2])
+
+# ---------- storage: pinning, expiry, free up, disk guard ----------
+import json  # noqa: E402
+CONF = f"{W}/home/.config/proton-drive-sync/config.json"
+with open(CONF, "w") as f:
+    json.dump(cfg, f)
+os.makedirs(f"{R}/keep/sub")
+for n, size in (("keep/k1.bin", 200_000), ("keep/sub/k2.bin", 200_000)):
+    with open(f"{R}/{n}", "wb") as f:
+        f.write(os.urandom(size))
+ops.dirs.clear()
+cache_root = f"{W}/mnt"
+check("pin command accepts a folder", lambda: pdsync.storage_command(dict(cfg), "pin", [f"{cache_root}/keep"]) == 0)
+check("pin is saved", lambda: json.load(open(CONF))["pinned"] == ["/keep"])
+check("pin command refuses paths outside the drive",
+      lambda: pdsync.storage_command(dict(cfg), "pin", ["/etc/passwd"]) == 1)
+check("pinned folder is downloaded without opening anything",
+      lambda: {"/keep/k1.bin", "/keep/sub/k2.bin"} <= set(ops.index), timeout=20)
+read_all("/docs/e1.bin")
+read_all("/docs/e2.bin")  # cache limit is ~500 KB: forces eviction of unpinned files
+check("pinned files survive eviction (and do not count against the limit)",
+      lambda: {"/keep/k1.bin", "/keep/sub/k2.bin"} <= set(ops.index) and "/docs/e2.bin" in ops.index)
+check("status reports pinned bytes", lambda: (pdsync_status := status()["cache"]) and pdsync_status["pinned"] > 0)
+
+ops.rename("/keep", "/kept")
+check("renaming a pinned folder keeps it pinned", lambda: json.load(open(CONF))["pinned"] == ["/kept"])
+
+# expiry: an unpinned download not opened for 2 days goes; pinned ones stay
+with ops.mu:
+    ops.index["/docs/e2.bin"]["atime"] = time.time() - 2 * 86400
+    ops.index["/kept/k1.bin"]["atime"] = time.time() - 2 * 86400
+cfg2 = dict(json.load(open(CONF)), cache_expire_days=1)
+with open(CONF, "w") as f:
+    json.dump(cfg2, f)
+check("expired downloads are removed", lambda: "/docs/e2.bin" not in ops.index, timeout=15)
+check("pinned files never expire", lambda: "/kept/k1.bin" in ops.index)
+
+# free up space: unpins and removes downloaded copies, files stay visible
+check("free command works", lambda: pdsync.storage_command(dict(cfg), "free", [f"{cache_root}/kept"]) == 0)
+check("free removes downloaded copies", lambda: not any(p.startswith("/kept/") for p in ops.index), timeout=15)
+check("freed files are still listed", lambda: "k1.bin" in ops.readdir("/kept"))
+check("freed folder is no longer pinned", lambda: json.load(open(CONF))["pinned"] == [])
+
+# disk guard: refuse downloads that would leave less than min_free_gb
+with open(CONF, "w") as f:
+    json.dump(dict(cfg2, min_free_gb=10 ** 6), f)
+check("settings reload", lambda: ops.settings["min_free_gb"] == 10 ** 6, timeout=10)
+check("download refused when the disk would get too full",
+      lambda: errno_of(lambda: ops.open("/kept/k1.bin", os.O_RDONLY)) == errno.ENOSPC)
+check("set command validates input", lambda: pdsync.storage_command(dict(cfg), "set", ["cache-limit", "x"]) == 1)
+check("set command stores value", lambda: pdsync.storage_command(dict(cfg), "set", ["min-free", "1"]) == 0
+      and json.load(open(CONF))["min_free_gb"] == 1)
+check("download allowed again", lambda: len(read_all("/kept/k1.bin")) == 200_000, timeout=10)
 shutil.rmtree(W, ignore_errors=True)
 print("failures:", fails)
 sys.exit(fails)

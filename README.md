@@ -1,6 +1,6 @@
 # proton-drive-sync
 
-**Proton Drive on Linux, OneDrive-style.** Your whole Proton Drive appears as a normal folder: files download when you open them, and every change you make is uploaded automatically. A simpler mode instead keeps one folder fully in sync. A status icon next to the clock shows what is being downloaded or uploaded.
+**Proton Drive on Linux with files on demand.** Your whole Proton Drive appears as a normal folder: files download when you open them, and every change you make is uploaded automatically. A simpler mode instead keeps one folder fully in sync. A status icon next to the clock shows what is being downloaded or uploaded.
 
 It is built on the [official Proton Drive CLI](https://proton.me/support/drive-cli). It installs and runs as your normal user, inside your home folder.
 
@@ -23,10 +23,10 @@ For other setups (no admin rights, servers or terminal only, building from sourc
 
 ## Two modes
 
-| | **1. Full / on-demand** (like OneDrive) | **2. Single folder** |
+| | **1. Full / on-demand** | **2. Single folder** |
 |---|---|---|
 | What you see | your entire Proton Drive | one folder, synced both ways with one Proton Drive folder |
-| Disk use | only files you have opened (cache, 10 GB by default) | everything in the folder |
+| Disk use | files you opened, added or chose to keep (see [Storage](#storage-on-this-device-mode-1)) | everything in the folder |
 | Needs | FUSE 3 | nothing beyond Python |
 | Admin rights | only if FUSE is not installed yet | never |
 
@@ -38,28 +38,69 @@ In both modes, new files, edits, new folders, renames, moves and deletes are syn
 3. Signs you in with `proton-drive auth login`, which shows a browser link you can open on any device.
 4. Installs a systemd user service so syncing starts by itself. Without systemd it uses cron `@reboot` plus desktop autostart.
 5. Adds the **status icon** if a desktop and PyGObject are present.
-6. In mode 1, excludes the folder from KDE's Baloo file indexer.
+6. In mode 1, excludes the folder from KDE's Baloo file indexer and adds **Proton Drive → Always keep on this device / Free up space** to the right-click menu of Dolphin and Nautilus.
 
 Everything goes into `~/.local/bin`, `~/.local/share`, `~/.config`, `~/.cache` and `~/.local/state`, under `proton-drive-sync`.
+
+## Storage on this device (mode 1)
+
+In mode 1, every file you open, copy in, or create is stored in a local cache (`~/.cache/proton-drive-sync`), and its changes are uploaded from there. What stays on disk is controlled by these rules:
+
+| Rule | Default | What it does |
+|---|---|---|
+| **Space for downloaded files** | 10 GB | When downloads use more, those not opened for the longest time are removed first. |
+| **Remove downloads not opened for** | 30 days | Downloads you haven't opened for this long are removed, even below the limit. |
+| **Always keep on this device** | nothing | Chosen files and folders are downloaded in the background and kept up to date. They never count against the limit, never expire, and new files you add inside them are kept too. |
+| **Keep free on disk** | 2 GB | Downloads are removed (oldest first) to keep this much space free on the disk. If that isn't enough, opening a not-yet-downloaded file fails with "No space left on device" instead of filling the disk. |
+
+A removed download only frees disk space: the file stays visible, stays on Proton Drive, and downloads again when you open it.
+
+**What is never removed:**
+- files that are open;
+- files with changes that haven't been uploaded yet, so copying in more than the limit is fine;
+- anything you chose to always keep.
+
+**Where to change it:**
+- **Status icon menu:** *Space for downloaded files*, *Remove downloads not opened for*, *Always keep on this device*, *Free up space now*.
+- **File manager:** right-click → *Proton Drive* → *Always keep on this device* or *Free up space*.
+- **Terminal:**
+  ```
+  proton-drive-sync pin ~/ProtonDrive/Work          # always keep on this device
+  proton-drive-sync unpin ~/ProtonDrive/Work        # back to normal (removed when unused)
+  proton-drive-sync free ~/ProtonDrive/Photos       # remove downloaded copies now
+  proton-drive-sync pins                            # list what is always kept
+  proton-drive-sync cache                           # disk use and settings
+  proton-drive-sync set cache-limit 50              # GB, or "none"
+  proton-drive-sync set expire-days 90              # days, or "never"
+  proton-drive-sync set min-free 5                  # GB
+  ```
+
+Changes take effect within seconds, without a restart. In mode 2 every file is always on the device, so these rules don't apply.
 
 ## Status icon
 - **Icon:** a cloud when everything is up to date, a download or upload arrow during transfers, and a warning icon on errors (for example when you need to log in again).
 - **Tooltip and right-click menu:** current transfers with progress, how many changes are waiting to upload, and recent activity.
+- **Storage settings in the right-click menu** (mode 1): see [Storage on this device](#storage-on-this-device-mode-1).
 - **Click:** opens the folder.
+- **Hiding it:** *Hide until next login* in its menu hides it; syncing continues. `proton-drive-sync start` shows it again.
 - **Desktops:** works natively on KDE Plasma, XFCE, Cinnamon, LXQt and Budgie, and on Ubuntu's GNOME. Other GNOME setups need the *AppIndicator and KStatusNotifierItem Support* extension.
 
 ## Managing it
 ```
 proton-drive-sync status | logs | start | stop | restart | login | logout
 proton-drive-sync update | reset-state | uninstall | version
+proton-drive-sync pin | unpin | free PATH... | pins | cache | set NAME VALUE   # mode 1 storage
 proton-drive-sync cli <args>    # the official CLI, using the same login
 ```
 
-Settings are in `~/.config/proton-drive-sync/config.json`; run `proton-drive-sync restart` after changing them.
+Settings are in `~/.config/proton-drive-sync/config.json`. The storage settings apply within seconds; for the others, run `proton-drive-sync restart` after changing them.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `cache_max_gb` | 10 | mode 1: disk space for downloaded files (least recently used are removed first) |
+| `cache_max_gb` | 10 | mode 1: space for downloaded files, 0 = no limit |
+| `cache_expire_days` | 30 | mode 1: remove downloads not opened for this many days, 0 = never |
+| `min_free_gb` | 2 | mode 1: always leave this much free on the disk |
+| `pinned` | `[]` | mode 1: paths always kept on this device, such as `"/Work"` |
 | `list_ttl` | 30 | mode 1: seconds before a folder listing is refreshed in the background |
 | `upload_delay` | 3 | mode 1: seconds to wait after a file is closed before uploading it |
 | `local_interval` | 15 | mode 2: seconds between local checks |
@@ -82,7 +123,7 @@ Settings are in `~/.config/proton-drive-sync/config.json`; run `proton-drive-syn
 
 ## Limitations
 - Changes made elsewhere show up after a short polling delay (about 30 s in mode 1, 2 min in mode 2), not instantly.
-- There are no per-file status marks inside the file manager and no right-click "free up space" or "always keep" options.
+- There are no per-file status marks (such as "downloaded" or "kept") inside the file manager. Use `proton-drive-sync cache` and `pins`, or the status icon.
 - Proton Docs and Sheets, and shared-with-me items, are not shown.
 - Symlinks, hard links and permissions are not synced.
 - Files that haven't been downloaded yet have no thumbnails.
