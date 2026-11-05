@@ -1,0 +1,39 @@
+# Tests every push and pull request; a pushed tag like v1.0.0 also publishes a GitHub Release
+# with the single-file executable, the dependency installer and their SHA-256 checksums.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/run.sh
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches version
+        run: |
+          v=$(sed -n 's/^VERSION=//p' src/installer.sh)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != version $v"; exit 1; }
+      - run: bash build.sh
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/proton-drive-sync dist/install-deps.sh dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --generate-notes
