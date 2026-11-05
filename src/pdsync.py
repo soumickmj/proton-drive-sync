@@ -15,7 +15,7 @@ Author: Soumick Chatterjee, PhD (https://github.com/soumickmj) — MIT licence.
 Unofficial; not affiliated with or endorsed by Proton AG.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import errno
 import fcntl
@@ -1647,6 +1647,26 @@ def run_sync(cfg):
 # and by GNOME with the AppIndicator extension). Reads status.json written by the daemon.
 # --------------------------------------------------------------------------------------
 
+# Tray icons: a cloud with a state glyph, written to disk at start and served via IconThemePath,
+# so the icon looks the same on every desktop and icon theme.
+TRAY_CLOUD = "M9.5 26a6.5 6.5 0 0 1-.9-12.94A8.5 8.5 0 0 1 25 12.6 6.75 6.75 0 0 1 24.25 26z"
+TRAY_GLYPHS = {
+    "idle": '<path d="M11.5 19l3 3 6-6.5" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>',
+    "download": '<path d="M16 13.5v9m-4-4 4 4 4-4" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>',
+    "upload": '<path d="M16 23v-9m-4 4 4-4 4 4" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>',
+    "busy": '<g fill="none" stroke="#fff" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 16.6a4.8 4.8 0 0 0-8.6-1"/><path d="M11.4 20.4a4.8 4.8 0 0 0 8.6 1"/><path d="M11.6 12.6v3h3"/><path d="M20.4 24.4v-3h-3"/></g>',
+    "error": '<path d="M16 13.5v5.5" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/><circle cx="16" cy="22.6" r="1.6" fill="#fff"/>',
+    "offline": '<path d="M5 6l22 22" stroke="#2b2b2b" stroke-width="4.5" stroke-linecap="round"/><path d="M5 6l22 22" stroke="#9a9a9a" stroke-width="2.2" stroke-linecap="round"/>',
+}
+
+
+def tray_icon_svg(state):
+    top, bottom = {"error": ("#ff6b6b", "#d93a3a"), "offline": ("#a8a8a8", "#7a7a7a")}.get(state, ("#9b7bff", "#6a46e6"))
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0" y1="0" '
+            f'x2="0" y2="1"><stop offset="0" stop-color="{top}"/><stop offset="1" stop-color="{bottom}"/>'
+            f'</linearGradient></defs><path d="{TRAY_CLOUD}" fill="url(#g)"/>{TRAY_GLYPHS[state]}</svg>')
+
+
 SNI_XML = """<node>
  <interface name="org.kde.StatusNotifierItem">
   <property name="Category" type="s" access="read"/>
@@ -1655,6 +1675,7 @@ SNI_XML = """<node>
   <property name="Status" type="s" access="read"/>
   <property name="IconName" type="s" access="read"/>
   <property name="AttentionIconName" type="s" access="read"/>
+  <property name="IconThemePath" type="s" access="read"/>
   <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
   <property name="ItemIsMenu" type="b" access="read"/>
   <property name="Menu" type="o" access="read"/>
@@ -1736,23 +1757,14 @@ def run_tray(cfg):
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
 
-    # pick icon names the installed themes actually provide
-    themes = [os.path.join(d, "icons") for d in
-              [os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")] +
-              (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")]
-    available = set()
-    for t in themes:
-        for dirpath, _, files in os.walk(t):
-            available.update(os.path.splitext(f)[0] for f in files)
-
-    def icon(*names):
-        return next((n for n in names if n in available), names[-1])
-    ICONS = {"idle": icon("folder-cloud", "folder-remote"),
-             "download": icon("cloud-download", "folder-download", "go-down"),
-             "upload": icon("cloud-upload", "folder-upload", "go-up"),
-             "busy": icon("state-sync", "emblem-synchronizing", "view-refresh"),
-             "error": icon("state-error", "dialog-error"),
-             "offline": icon("state-offline", "network-offline")}
+    icon_dir = os.path.join(STATE_DIR, "icons")
+    apps_dir = os.path.join(icon_dir, "hicolor", "scalable", "apps")
+    os.makedirs(apps_dir, exist_ok=True)
+    ICONS = {k: f"{APP_NAME}-{k}" for k in TRAY_GLYPHS}
+    for k, name in ICONS.items():
+        for d in (icon_dir, apps_dir):  # flat for GTK's unthemed lookup, hicolor for KDE
+            with open(os.path.join(d, name + ".svg"), "w") as f:
+                f.write(tray_icon_svg(k))
 
     st = {"snap": {}, "running": False, "mtime": None, "rev": 1, "icon": None, "status": None, "tip": None,
           "items": {}}
@@ -1953,8 +1965,10 @@ def run_tray(cfg):
 
     def tooltip():
         ic, head, lines, recent = describe()
-        body = "<br/>".join(html.escape(x) for x in lines[:6]) or html.escape(root)
-        return GLib.Variant("(sa(iiay)ss)", (ic, [], "Proton Drive", f"<b>{html.escape(head)}</b><br/>{body}"))
+        # newline-separated, no <br/>: XFCE feeds this to Pango markup, which rejects <br/> and
+        # then silently shows the previous tooltip (e.g. a neighbouring icon's)
+        body = "\n".join(html.escape(x, quote=False) for x in [head] + (lines[:6] or [root]))
+        return GLib.Variant("(sa(iiay)ss)", (ic, [], "Proton Drive", body))
 
     def sni_method(conn, sender, obj, iface, method, params, inv):
         if iface == "org.kde.StatusNotifierItem":
@@ -1998,6 +2012,7 @@ def run_tray(cfg):
                 "Title": GLib.Variant("s", "Proton Drive"),
                 "Status": GLib.Variant("s", "NeedsAttention" if ic == ICONS["error"] else "Active"),
                 "IconName": GLib.Variant("s", ic), "AttentionIconName": GLib.Variant("s", ICONS["error"]),
+                "IconThemePath": GLib.Variant("s", icon_dir),
                 "ToolTip": tooltip(), "ItemIsMenu": GLib.Variant("b", False),
                 "Menu": GLib.Variant("o", menu_path)}.get(prop)
 

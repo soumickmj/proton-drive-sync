@@ -14,7 +14,7 @@ set -euo pipefail
 umask 077
 
 APP=proton-drive-sync
-VERSION=1.1.0
+VERSION=1.1.1
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$APP"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
@@ -381,7 +381,9 @@ install_tray() {
         warn "Install it, then run '$APP update'."
         return 0
     fi
-    if has_systemd_user && systemctl --user cat graphical-session.target >/dev/null 2>&1; then
+    # Only desktops that actually activate graphical-session.target (GNOME, Plasma 6, ...) get a
+    # systemd unit; others (XFCE, Cinnamon, MATE, ...) never start it, so use XDG autostart there.
+    if has_systemd_user && systemctl --user is-active --quiet graphical-session.target; then
         mkdir -p "$UNIT_DIR"
         cat > "$TRAY_UNIT" <<EOF
 [Unit]
@@ -400,10 +402,13 @@ WantedBy=graphical-session.target
 EOF
         systemctl --user daemon-reload
         systemctl --user enable "$APP-tray.service" >/dev/null 2>&1 || true
-        if systemctl --user is-active --quiet graphical-session.target; then
-            systemctl --user restart "$APP-tray.service" || true
-        fi
+        systemctl --user restart "$APP-tray.service" || true
+        rm -f "$AUTOSTART_DIR/$APP-tray.desktop"
     else
+        if [ -f "$TRAY_UNIT" ]; then # left over from an install that picked the unit; it never starts here
+            systemctl --user disable --now "$APP-tray.service" >/dev/null 2>&1 || true
+            rm -f "$TRAY_UNIT"; systemctl --user daemon-reload 2>/dev/null || true
+        fi
         mkdir -p "$AUTOSTART_DIR"
         cat > "$AUTOSTART_DIR/$APP-tray.desktop" <<EOF
 [Desktop Entry]
