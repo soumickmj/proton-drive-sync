@@ -123,6 +123,28 @@ ops.rename("/.hello.txt.swp~tmp", "/hello.txt")
 check("atomic save uploads to original name", lambda: rtext("hello.txt") == b"atomic save\n")
 check("temp file never uploaded", lambda: not any(n.startswith(".hello") for n in os.listdir(R)))
 
+# saving again just after an upload landed, before the daemon noted its new revision: not a conflict
+write_file("/race.txt", b"v0\n", create=True)
+check("race: first version uploaded", lambda: rtext("race.txt") == b"v0\n")
+real_fetch, landed = ops.fetch, threading.Event()
+
+
+def held_fetch(path):
+    if "upload_worker" in threading.current_thread().name and rtext("race.txt") == b"v1\n":
+        landed.wait(5)
+    return real_fetch(path)
+
+
+ops.fetch = held_fetch
+write_file("/race.txt", b"v1\n")
+check("race: second version uploaded", lambda: rtext("race.txt") == b"v1\n")
+write_file("/.race.txt.swp~tmp", b"v2\n", create=True)
+ops.rename("/.race.txt.swp~tmp", "/race.txt")
+landed.set()
+ops.fetch = real_fetch
+check("race: quick re-save uploads to original name", lambda: rtext("race.txt") == b"v2\n")
+check("race: own upload is not a conflict", lambda: not any("conflict" in n for n in os.listdir(R)))
+
 ops.mkdir("/newdir", 0o755)
 check("mkdir creates remote folder", lambda: os.path.isdir(f"{R}/newdir"))
 ops.rename("/new.txt", "/newdir/moved.txt")
@@ -280,6 +302,31 @@ check("set command validates input", lambda: pdsync.storage_command(dict(cfg), "
 check("set command stores value", lambda: pdsync.storage_command(dict(cfg), "set", ["min-free", "1"]) == 0
       and json.load(open(CONF))["min_free_gb"] == 1)
 check("download allowed again", lambda: len(read_all("/kept/k1.bin")) == 200_000, timeout=10)
+
+# Thunar menu: the user's own actions survive untouched, byte for byte
+UCA = f"{W}/home/.config/Thunar/uca.xml"
+MINE = ('<?xml encoding="UTF-8" version="1.0"?>\n<actions>\n<action>\n\t<name>Mine &amp; yours</name>\n'
+        '\t<unique-id>1-1</unique-id>\n\t<command>x %f</command>\n</action>\n</actions>\n')
+os.makedirs(os.path.dirname(UCA))
+with open(UCA, "w") as f:
+    f.write(MINE)
+uca = lambda: open(UCA).read()
+check("thunar: add succeeds", lambda: pdsync.thunar_menu("add", "/opt/my dir/pds") == 0)
+check("thunar: both actions in the submenu, path quoted", lambda: uca().count("<submenu>Proton Drive</submenu>") == 2
+      and "<command>'/opt/my dir/pds' pin %F</command>" in uca() and "Mine &amp; yours" in uca())
+check("thunar: adding twice changes nothing", lambda: (before := uca()) and pdsync.thunar_menu("add", "/opt/my dir/pds") == 0
+      and uca() == before)
+check("thunar: remove restores the file exactly", lambda: pdsync.thunar_menu("remove") == 0 and uca() == MINE)
+with open(UCA, "w") as f:
+    f.write("<actions>\n<broken")
+check("thunar: a damaged file is left alone", lambda: pdsync.thunar_menu("add", "/x") == 1 and uca() == "<actions>\n<broken")
+os.remove(UCA)
+os.makedirs(f"{W}/xdg/Thunar")
+with open(f"{W}/xdg/Thunar/uca.xml", "w") as f:
+    f.write(MINE)
+os.environ["XDG_CONFIG_DIRS"] = f"{W}/xdg"
+check("thunar: a new file starts from the system defaults", lambda: pdsync.thunar_menu("add", "/x") == 0
+      and "Mine &amp; yours" in uca() and "/x pin %F" in uca())
 shutil.rmtree(W, ignore_errors=True)
 print("failures:", fails)
 sys.exit(fails)

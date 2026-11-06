@@ -15,7 +15,7 @@ Author: Soumick Chatterjee, PhD (https://github.com/soumickmj) — MIT licence.
 Unofficial; not affiliated with or endorsed by Proton AG.
 """
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import errno
 import fcntl
@@ -530,7 +530,8 @@ def run_mount(cfg):
             threading.Thread(target=self.dirs_saver, daemon=True).start()
             status.pending_fn = lambda: len(self.upload_due)
             self.settings = with_storage_defaults(dict(cfg))
-            self.cfg_mtime = self.config_mtime()
+            self.own_revs = {}  # path -> revision we last uploaded there
+            self.cfg_stamp = self.config_stamp()
             self.pin_wake = threading.Event()
             self.pin_problem = None
             threading.Thread(target=self.maintenance, daemon=True).start()
@@ -890,9 +891,11 @@ def run_mount(cfg):
         def make_room(self, size):
             return self.evict(need=size or 0)
 
-        def config_mtime(self):
+        def config_stamp(self):
+            # mtime alone misses a second write in the same clock tick (a few ms on ext4)
             try:
-                return os.stat(CONFIG_FILE).st_mtime_ns
+                st = os.stat(CONFIG_FILE)
+                return st.st_mtime_ns, st.st_ino, st.st_size
             except OSError:
                 return None
 
@@ -939,9 +942,9 @@ def run_mount(cfg):
             while True:
                 time.sleep(2)
                 try:
-                    m = self.config_mtime()
-                    if m != self.cfg_mtime:
-                        self.cfg_mtime = m
+                    stamp = self.config_stamp()
+                    if stamp != self.cfg_stamp:
+                        self.cfg_stamp = stamp
                         self.reload_settings()
                     self.handle_requests()
                     if time.time() - last_sweep > 60:
@@ -1015,7 +1018,6 @@ def run_mount(cfg):
                 c["pinned"] = pins
             try:
                 self.settings["pinned"] = update_config(change)["pinned"]
-                self.cfg_mtime = self.config_mtime()
             except (OSError, ValueError) as ex:
                 log.warning("could not update kept-on-device list: %s", ex)
 
@@ -1268,7 +1270,7 @@ def run_mount(cfg):
                 strategy = "create-new-revision"
                 if remote is not None and remote.is_dir:
                     target_name, strategy = conflict_name(name), "rename"
-                elif remote is not None and remote.rev != entry.get("base_rev"):
+                elif remote is not None and remote.rev not in (entry.get("base_rev"), self.own_revs.get(path)):
                     target_name, strategy = conflict_name(name), "rename"
                     log.warning("conflict on %s: remote changed meanwhile, uploading as %s", path, target_name)
                     notify("Proton Drive: conflict", f"Your copy was saved as {target_name}")
@@ -1282,6 +1284,9 @@ def run_mount(cfg):
                     shutil.rmtree(stage, ignore_errors=True)
                 nodes = self.fetch(parent)
                 with self.mu:
+                    if target_name == name and name in nodes:
+                        # a save during this upload may have noted the older revision as its base
+                        self.own_revs[path] = nodes[name].rev
                     cur = self.index.get(path)
                     if cur is not entry:
                         return
@@ -1906,8 +1911,7 @@ def run_tray(cfg):
             items.append(mk("free", "Free up space now", icon="edit-clear",
                             action=lambda: request_free(["/"])))
             items.append(mk("sep3", sep=True))
-        items.append(mk("open", "Open Proton Drive folder", icon="folder-open",
-                        action=lambda: open_uri(Gio.File.new_for_path(root).get_uri())))
+        items.append(mk("open", "Open Proton Drive folder", icon="folder-open", action=open_folder))
         items.append(mk("web", "Open Proton Drive in browser", icon="internet-web-browser",
                         action=lambda: open_uri("https://drive.proton.me/")))
         items.append(mk("sep4", sep=True))
@@ -1945,6 +1949,18 @@ def run_tray(cfg):
             if shutil.which("xdg-open"):
                 subprocess.Popen(["xdg-open", uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def open_folder():
+        """Ask the desktop's file manager first: the default app for folders can be something else
+        (Catfish, the XFCE search tool, registers itself for them and wins on Manjaro XFCE)."""
+        uri = Gio.File.new_for_path(root).get_uri()
+        try:
+            bus.call_sync("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                          "org.freedesktop.FileManager1", "ShowFolders", GLib.Variant("(ass)", ([uri], "")),
+                          None, Gio.DBusCallFlags.NONE, 5000, None)
+        except GLib.Error as ex:
+            log.info("no file manager service (%s); using the default app for folders", ex.message)
+            open_uri(uri)
+
     def hide():
         notify("Proton Drive", "The status icon is hidden until you log in again. Syncing continues. "
                                "To show it now, run: proton-drive-sync start")
@@ -1973,7 +1989,7 @@ def run_tray(cfg):
     def sni_method(conn, sender, obj, iface, method, params, inv):
         if iface == "org.kde.StatusNotifierItem":
             if method in ("Activate", "SecondaryActivate"):
-                open_uri(Gio.File.new_for_path(root).get_uri())
+                open_folder()
             inv.return_value(None)
             return
         if method == "GetLayout":
@@ -2170,6 +2186,62 @@ def storage_command(cfg, cmd, args):
     return 2
 
 
+def thunar_menu(action, cli=None):
+    """Adds or removes our Thunar custom actions. Edits uca.xml as text: the file holds the user's
+    own actions and must stay as it was (it often isn't strict XML either, for example a reordered
+    <?xml?> declaration, which Thunar's parser accepts). Thunar can't limit an action to a folder,
+    so these show everywhere; the commands refuse paths outside the drive, with a notification."""
+    import re
+    import shlex
+    from xml.sax.saxutils import escape
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    path = os.path.realpath(os.path.join(home, "Thunar", "uca.xml"))
+    source = path
+    if action == "add" and not os.path.exists(path):
+        # Thunar reads the user's file *instead of* the system one, so start from a copy of it
+        dirs = (os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg").split(":")
+        source = next((p for p in (os.path.join(d, "Thunar", "uca.xml") for d in dirs) if os.path.exists(p)), path)
+    try:
+        with open(source, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        if action == "remove":
+            return 0
+        text = '<?xml version="1.0" encoding="UTF-8"?>\n<actions>\n</actions>\n'
+    new = re.sub(r"<action>.*?</action>\s*",
+                 lambda m: "" if f"<unique-id>{APP_NAME}-" in m[0] else m[0], text, flags=re.S)
+    if action == "add":
+        if new.count("</actions>") != 1:
+            print(f"{path} doesn't look right; not changing it.", file=sys.stderr)
+            return 1
+        items = "".join(f"""<action>
+\t<icon>{icon}</icon>
+\t<name>{name}</name>
+\t<submenu>Proton Drive</submenu>
+\t<unique-id>{APP_NAME}-{cmd}</unique-id>
+\t<command>{escape(shlex.quote(cli))} {cmd} %F</command>
+\t<description></description>
+\t<patterns>*</patterns>
+\t<directories/>
+\t<audio-files/>
+\t<image-files/>
+\t<other-files/>
+\t<text-files/>
+\t<video-files/>
+</action>
+""" for cmd, name, icon in (("pin", "Always keep on this device", "folder-download"),
+                            ("free", "Free up space", "edit-clear")))
+        new = new.replace("</actions>", items + "</actions>")
+    if new != text or source != path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new)
+        shutil.copymode(source, tmp) if os.path.exists(source) else os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    return 0
+
+
 def main():
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
@@ -2191,6 +2263,8 @@ def main():
         run_tray(cfg)
     elif cmd in STORAGE_COMMANDS:
         sys.exit(storage_command(cfg, cmd, sys.argv[2:]))
+    elif cmd == "thunar-menu":
+        sys.exit(thunar_menu(*sys.argv[2:4]))
     else:
         print(f"unknown command {cmd}", file=sys.stderr)
         sys.exit(2)

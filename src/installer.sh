@@ -14,7 +14,7 @@ set -euo pipefail
 umask 077
 
 APP=proton-drive-sync
-VERSION=1.1.1
+VERSION=1.1.2
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$APP"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
@@ -354,6 +354,12 @@ EOF
             chmod 700 "$FM_NAUTILUS_DIR/$label"
         done
     fi
+    if command -v thunar >/dev/null 2>&1 || [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/Thunar" ]; then
+        "$PY" -I "$DATA_DIR/pdsync.py" thunar-menu add "$BIN_DIR/$APP" || warn "Could not add the Thunar menu."
+        if pgrep -xiu "$(id -u)" thunar >/dev/null; then
+            info "Thunar reads its menu when it starts: run 'thunar -q' (closes its windows), then open it again."
+        fi
+    fi
     info "Added 'Always keep on this device' and 'Free up space' to the file manager's right-click menu."
 }
 
@@ -361,6 +367,7 @@ remove_file_manager_menus() {
     rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/kio/servicemenus/$APP.desktop" \
           "${XDG_DATA_HOME:-$HOME/.local/share}/nautilus/scripts/Proton Drive - Always keep on this device" \
           "${XDG_DATA_HOME:-$HOME/.local/share}/nautilus/scripts/Proton Drive - Free up space"
+    "$PY" -I "$DATA_DIR/pdsync.py" thunar-menu remove 2>/dev/null || true
 }
 
 # KDE's Baloo indexer would otherwise crawl the whole mounted drive.

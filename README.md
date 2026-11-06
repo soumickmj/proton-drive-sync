@@ -38,7 +38,7 @@ In both modes, new files, edits, new folders, renames, moves and deletes are syn
 3. Signs you in with `proton-drive auth login`, which shows a browser link you can open on any device.
 4. Installs a systemd user service so syncing starts by itself. Without systemd it uses cron `@reboot` plus desktop autostart.
 5. Adds the **status icon** if a desktop and PyGObject are present.
-6. In mode 1, excludes the folder from KDE's Baloo file indexer and adds **Proton Drive → Always keep on this device / Free up space** to the right-click menu of Dolphin and Nautilus.
+6. In mode 1, excludes the folder from KDE's Baloo file indexer and adds **Proton Drive → Always keep on this device / Free up space** to the right-click menu of Dolphin, Nautilus and Thunar.
 
 Everything goes into `~/.local/bin`, `~/.local/share`, `~/.config`, `~/.cache` and `~/.local/state`, under `proton-drive-sync`.
 
